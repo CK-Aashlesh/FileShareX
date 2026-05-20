@@ -1,0 +1,26 @@
+{
+  "name": "filesharex",
+  "version": "1.0.0",
+  "description": "Premium LAN Chat and File Sharing Web Application",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "lan",
+    "chat",
+    "file-sharing",
+    "offline-first",
+    "socket.io",
+    "chunked-uploads"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1",
+    "qrcode": "^1.5.3",
+    "socket.io": "^4.7.5",
+    "sqlite3": "^5.1.7"
+  }
+}
