@@ -1052,7 +1052,7 @@ button {
   width: 100%;
   padding: 12px;
   background-color: var(--text-primary);
-  color: #ffffff;
+  color: #000000;
   font-weight: 600;
   font-size: 0.95rem;
   border-radius: 8px;
