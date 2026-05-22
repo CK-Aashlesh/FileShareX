@@ -175,8 +175,9 @@ const DOM = {
   networkBadge: document.getElementById('network-badge-trigger'),
   networkIpDisplay: document.getElementById('network-ip-display'),
   
-  channelItems: document.querySelectorAll('.channel-item'),
+  channelList: document.getElementById('channel-list'),
   activeChannelName: document.getElementById('active-channel-name'),
+  activeChannelLock: document.getElementById('active-channel-lock'),
   userCount: document.getElementById('user-count'),
   usersList: document.getElementById('users-list'),
   
@@ -207,6 +208,21 @@ const DOM = {
   usernameModal: document.getElementById('username-modal'),
   usernameForm: document.getElementById('username-form'),
   usernameInput: document.getElementById('username-input'),
+
+  createRoomBtn: document.getElementById('create-room-btn'),
+  createRoomModal: document.getElementById('create-room-modal'),
+  createRoomForm: document.getElementById('create-room-form'),
+  roomNameInput: document.getElementById('room-name-input'),
+  roomPasswordInput: document.getElementById('room-password-input'),
+  toggleCreatePwd: document.getElementById('toggle-create-pwd'),
+  createRoomError: document.getElementById('create-room-error'),
+
+  roomPasswordModal: document.getElementById('room-password-modal'),
+  roomPwdTargetName: document.getElementById('room-pwd-target-name'),
+  roomPasswordForm: document.getElementById('room-password-form'),
+  joinPasswordInput: document.getElementById('join-password-input'),
+  toggleJoinPwd: document.getElementById('toggle-join-pwd'),
+  joinRoomError: document.getElementById('join-room-error'),
   
   qrModal: document.getElementById('qr-modal'),
   qrCodeImg: document.getElementById('qr-code-img'),
@@ -225,6 +241,11 @@ const DOM = {
   closeModalBtns: document.querySelectorAll('.close-modal-btn')
 };
 
+// Track all known rooms (updated from server)
+let knownRooms = [];
+// Pending channel switch target when password is required
+let pendingPasswordChannel = null;
+
 // ==========================================================================
 // Initialization & Socket Binding
 // ==========================================================================
@@ -232,6 +253,24 @@ function initApp() {
   setupSocket();
   setupEventListeners();
   fetchNetworkInfo();
+
+  // Restore sidebar collapse state on desktop
+  const sidebarCollapsed = localStorage.getItem('fsx_sidebar_collapsed') === 'true';
+  if (sidebarCollapsed && window.innerWidth > 768) {
+    DOM.app.classList.add('sidebar-collapsed');
+  }
+
+  // Restore saved username from localStorage — skip modal if found
+  const savedUsername = localStorage.getItem('fsx_username');
+  if (savedUsername) {
+    state.username = savedUsername;
+    DOM.currentUserName.innerText = savedUsername;
+    DOM.currentUserAvatar.innerText = savedUsername.charAt(0).toUpperCase();
+    DOM.usernameInput.value = savedUsername;
+    DOM.usernameModal.classList.remove('active');
+    DOM.app.classList.remove('hidden');
+    socket.connect();
+  }
 }
 
 function setupSocket() {
@@ -294,6 +333,30 @@ function setupSocket() {
     renderOnlineUsers();
   });
 
+  // Room list updates from server
+  socket.on('room-list-update', (rooms) => {
+    knownRooms = rooms;
+    renderRoomList();
+  });
+
+  // Handle message deletion broadcast
+  socket.on('message-deleted', ({ msgId }) => {
+    const el = document.querySelector(`[data-msg-id="${msgId}"]`);
+    if (el) {
+      el.classList.add('msg-deleting');
+      setTimeout(() => el.remove(), 260);
+    }
+  });
+
+  // Handle room deletion broadcast
+  socket.on('room-deleted', ({ roomId }) => {
+    // If we are currently in the deleted room, fall back to #general
+    if (state.currentChannel === roomId) {
+      doJoinChannel('#general', null);
+      appendSystemAnnouncement('This room was deleted. You have been moved to #general.');
+    }
+  });
+
   // Handle typing statuses in sidebar and indicator
   const activeTypingUsers = new Set();
   socket.on('typing-status', (data) => {
@@ -345,6 +408,7 @@ function appendMessage(msg) {
   
   const msgGroup = document.createElement('div');
   msgGroup.className = `msg-group ${isSelf ? 'self' : ''}`;
+  if (msg.id) msgGroup.setAttribute('data-msg-id', msg.id);
 
   // User initials avatar
   const avatarCol = isSelf ? state.color : (getUserColor(msg.username) || '#cbd5e1');
@@ -356,10 +420,27 @@ function appendMessage(msg) {
       <div class="msg-meta">
         <span class="sender">${escapeHTML(msg.username)}</span>
         <span class="timestamp">${timeStr}</span>
+        ${isSelf && msg.id ? `<button class="msg-delete-btn" title="Delete message" data-msg-id="${msg.id}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 6 5 6 21 6"></polyline>
+            <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>
+            <path d="M10 11v6"></path><path d="M14 11v6"></path>
+            <path d="M9 6V4h6v2"></path>
+          </svg>
+        </button>` : ''}
       </div>
       <div class="msg-content"></div>
     </div>
   `;
+
+  // Wire up delete button
+  const deleteBtn = msgGroup.querySelector('.msg-delete-btn');
+  if (deleteBtn) {
+    deleteBtn.addEventListener('click', () => {
+      if (!confirm('Delete this message for everyone?')) return;
+      socket.emit('delete-message', { msgId: msg.id });
+    });
+  }
 
   const contentContainer = msgGroup.querySelector('.msg-content');
 
@@ -373,14 +454,12 @@ function appendMessage(msg) {
     const isVideo = msg.fileType && msg.fileType.startsWith('video/');
 
     if (isImage) {
-      // Inline image visual card
       const div = document.createElement('div');
       div.className = 'image-preview-attachment';
       div.innerHTML = `<img src="${msg.fileUrl}" alt="${escapeHTML(msg.fileName)}" loading="lazy">`;
       div.addEventListener('click', () => openPreviewModal(msg.fileName, msg.fileUrl, msg.fileType));
       contentContainer.appendChild(div);
     } else if (isVideo) {
-      // Inline video visual player card
       const div = document.createElement('div');
       div.className = 'image-preview-attachment';
       div.innerHTML = `
@@ -392,11 +471,8 @@ function appendMessage(msg) {
       contentContainer.appendChild(div);
     }
 
-    // Always append the download file card details beneath or as primary
     const fileCard = document.createElement('div');
     fileCard.className = 'file-card';
-    
-    // Select custom offline SVG icon based on file type
     const svgIcon = getFileTypeSVG(msg.fileName, msg.fileType);
 
     fileCard.innerHTML = `
@@ -425,10 +501,7 @@ function appendMessage(msg) {
     `;
 
     const viewBtn = fileCard.querySelector('.view-btn');
-    if (viewBtn) {
-      viewBtn.addEventListener('click', () => openPreviewModal(msg.fileName, msg.fileUrl, msg.fileType));
-    }
-
+    if (viewBtn) viewBtn.addEventListener('click', () => openPreviewModal(msg.fileName, msg.fileUrl, msg.fileType));
     contentContainer.appendChild(fileCard);
   }
 
@@ -441,6 +514,111 @@ function appendSystemAnnouncement(text) {
   div.className = 'system-msg';
   div.innerHTML = `<span class="system-msg-content">${escapeHTML(text)}</span>`;
   DOM.messagesContainer.appendChild(div);
+}
+
+// Render dynamic rooms list in sidebar
+function renderRoomList() {
+  DOM.channelList.innerHTML = '';
+  knownRooms.forEach(room => {
+    const isOwner = !room.isDefault && room.createdBy === state.username;
+    const li = document.createElement('li');
+    li.className = 'channel-item' + (room.id === state.currentChannel ? ' active' : '');
+    li.setAttribute('data-channel', room.id);
+
+    const lockIcon = room.hasPassword ? `<span class="room-lock-icon" title="Password protected">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+        <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+      </svg>
+    </span>` : '';
+
+    const deleteRoomBtn = isOwner ? `<button class="room-delete-btn" title="Delete room">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line>
+      </svg>
+    </button>` : '';
+
+    li.innerHTML = `
+      <span class="hash">#</span>
+      <span class="channel-name-text">${escapeHTML(room.displayName)}</span>
+      ${lockIcon}${deleteRoomBtn}
+    `;
+
+    // Click on list item = switch channel (but not if clicking the delete btn)
+    li.addEventListener('click', (e) => {
+      if (e.target.closest('.room-delete-btn')) return;
+      switchChannel(room.id);
+    });
+
+    // Delete room button
+    const delBtn = li.querySelector('.room-delete-btn');
+    if (delBtn) {
+      delBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (!confirm(`Delete room "${room.displayName}"? All members will be moved to #general.`)) return;
+        socket.emit('delete-room', { roomId: room.id });
+      });
+    }
+
+    DOM.channelList.appendChild(li);
+  });
+}
+
+// Switch to a channel, prompting for password if needed
+function switchChannel(channelId) {
+  if (channelId === state.currentChannel) return;
+  const room = knownRooms.find(r => r.id === channelId);
+  if (!room) return;
+
+  if (room.hasPassword) {
+    // Show password prompt first
+    pendingPasswordChannel = channelId;
+    DOM.roomPwdTargetName.innerText = channelId;
+    DOM.joinPasswordInput.value = '';
+    DOM.joinRoomError.classList.add('hidden');
+    DOM.joinRoomError.innerText = '';
+    DOM.roomPasswordModal.classList.add('active');
+    setTimeout(() => DOM.joinPasswordInput.focus(), 80);
+  } else {
+    doJoinChannel(channelId, null);
+  }
+}
+
+// Actually join a channel after password checks
+function doJoinChannel(channelId, password) {
+  socket.emit('join-channel', channelId, password, (result) => {
+    if (result && result.error) {
+      if (result.error === 'wrong_password') {
+        DOM.joinRoomError.innerText = 'Incorrect password. Please try again.';
+        DOM.joinRoomError.classList.remove('hidden');
+      } else {
+        DOM.joinRoomError.innerText = result.error;
+        DOM.joinRoomError.classList.remove('hidden');
+      }
+      return;
+    }
+    // Success
+    DOM.roomPasswordModal.classList.remove('active');
+    pendingPasswordChannel = null;
+
+    // Update sidebar active state
+    state.currentChannel = channelId;
+    const room = knownRooms.find(r => r.id === channelId);
+    DOM.activeChannelName.innerText = room ? room.displayName : channelId.substring(1);
+
+    // Show lock badge in header if password-protected
+    if (room && room.hasPassword) {
+      DOM.activeChannelLock.classList.remove('hidden');
+    } else {
+      DOM.activeChannelLock.classList.add('hidden');
+    }
+
+    DOM.dragChannelLabel.innerText = channelId;
+    renderRoomList();
+    clearSearch();
+
+    if (window.innerWidth <= 768) toggleSidebar(false);
+  });
 }
 
 // Render active users list inside sidebar
@@ -893,55 +1071,94 @@ function setupEventListeners() {
       DOM.currentUserName.innerText = selectedUsername;
       DOM.currentUserAvatar.innerText = selectedUsername.charAt(0).toUpperCase();
 
-      // Establish Socket connection
-      socket.connect();
+      // Persist for future sessions
+      localStorage.setItem('fsx_username', selectedUsername);
 
-      // Transmit identity selection
-      socket.emit('set-username', selectedUsername);
+      // Connect or re-register if already connected
+      if (!socket.connected) {
+        socket.connect();
+      } else {
+        socket.emit('set-username', selectedUsername);
+      }
 
-      // Hide Overlay Join window and show workspace
       DOM.usernameModal.classList.remove('active');
       DOM.app.classList.remove('hidden');
     }
   });
 
-  // Footer change username trigger
+  // Footer change username trigger — pre-fill with current name
   DOM.editUsernameBtn.addEventListener('click', () => {
     DOM.usernameInput.value = state.username;
     DOM.usernameModal.classList.add('active');
   });
 
-  // 2. Sidebar Navigation Channels
-  DOM.channelItems.forEach(item => {
-    item.addEventListener('click', () => {
-      const targetChannel = item.getAttribute('data-channel');
-      if (targetChannel === state.currentChannel) return;
+  // 2. Create Room button
+  DOM.createRoomBtn.addEventListener('click', () => {
+    DOM.createRoomForm.reset();
+    DOM.createRoomError.classList.add('hidden');
+    DOM.createRoomError.innerText = '';
+    DOM.createRoomModal.classList.add('active');
+    setTimeout(() => DOM.roomNameInput.focus(), 80);
+  });
 
-      // Update UI active styles
-      DOM.channelItems.forEach(ch => ch.classList.remove('active'));
-      item.classList.add('active');
+  // Create Room form submission
+  DOM.createRoomForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const name = DOM.roomNameInput.value.trim();
+    const password = DOM.roomPasswordInput.value;
+    if (!name) return;
 
-      state.currentChannel = targetChannel;
-      DOM.activeChannelName.innerText = targetChannel.substring(1);
-      
-      // Update typing tags on change
-      DOM.dragChannelLabel.innerText = targetChannel;
+    DOM.createRoomError.classList.add('hidden');
+    const submitBtn = DOM.createRoomForm.querySelector('[type=submit]');
+    submitBtn.disabled = true;
+    submitBtn.innerText = 'Creating...';
 
-      // Signal channel migration
-      socket.emit('join-channel', targetChannel);
-
-      // Clear search on switching rooms
-      clearSearch();
-
-      // On mobile viewports, automatically fold sidebar on channel clicks
-      if (window.innerWidth <= 768) {
-        toggleSidebar(false);
+    socket.emit('create-room', { name, password }, (result) => {
+      submitBtn.disabled = false;
+      submitBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg> Create Room`;
+      if (result && result.error) {
+        DOM.createRoomError.innerText = result.error;
+        DOM.createRoomError.classList.remove('hidden');
+        return;
+      }
+      // Auto-join the newly created room
+      DOM.createRoomModal.classList.remove('active');
+      if (result && result.roomId) {
+        setTimeout(() => switchChannel(result.roomId), 200);
       }
     });
   });
 
-  // Mobile Side panel triggers
-  DOM.sidebarToggle.addEventListener('click', () => toggleSidebar(true));
+  // Password toggle for create room
+  DOM.toggleCreatePwd.addEventListener('click', () => {
+    const input = DOM.roomPasswordInput;
+    input.type = input.type === 'password' ? 'text' : 'password';
+  });
+
+  // 3. Room password join modal
+  DOM.roomPasswordForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (!pendingPasswordChannel) return;
+    const pwd = DOM.joinPasswordInput.value;
+    DOM.joinRoomError.classList.add('hidden');
+    doJoinChannel(pendingPasswordChannel, pwd);
+  });
+
+  DOM.toggleJoinPwd.addEventListener('click', () => {
+    const input = DOM.joinPasswordInput;
+    input.type = input.type === 'password' ? 'text' : 'password';
+  });
+
+  // Sidebar panel toggles (handles both desktop collapse and mobile overlay)
+  DOM.sidebarToggle.addEventListener('click', () => {
+    if (window.innerWidth > 768) {
+      DOM.app.classList.toggle('sidebar-collapsed');
+      const isCollapsed = DOM.app.classList.contains('sidebar-collapsed');
+      localStorage.setItem('fsx_sidebar_collapsed', isCollapsed ? 'true' : 'false');
+    } else {
+      toggleSidebar(true);
+    }
+  });
   DOM.sidebarClose.addEventListener('click', () => toggleSidebar(false));
   DOM.sidebarOverlay.addEventListener('click', () => toggleSidebar(false));
 
@@ -1098,8 +1315,8 @@ function clearSearch() {
   DOM.clearSearchBtn.classList.add('hidden');
   state.searchQuery = '';
   
-  // Reload current channel history
-  socket.emit('join-channel', state.currentChannel);
+  // Reload current channel history (no password needed, already joined)
+  socket.emit('join-channel', state.currentChannel, null, () => {});
 }
 
 // ==========================================================================

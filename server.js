@@ -90,6 +90,46 @@ function getUniqueFilename(originalName) {
   return fileName;
 }
 
+// ============================================================
+// Room Registry (in-memory, persists while server is running)
+// ============================================================
+// Map of roomId -> { name, displayName, hasPassword, passwordHash, createdBy, createdAt, memberCount }
+const rooms = new Map();
+
+// Default built-in rooms (no password)
+const DEFAULT_ROOMS = [
+  { id: '#general',      displayName: 'general',      hasPassword: false },
+  { id: '#shared-files', displayName: 'shared-files', hasPassword: false },
+  { id: '#random',       displayName: 'random',       hasPassword: false },
+];
+
+DEFAULT_ROOMS.forEach(r => {
+  rooms.set(r.id, {
+    id: r.id,
+    displayName: r.displayName,
+    hasPassword: false,
+    passwordHash: null,
+    createdBy: 'system',
+    createdAt: Date.now(),
+    isDefault: true,
+  });
+});
+
+function hashPassword(pwd) {
+  return crypto.createHash('sha256').update(pwd + 'filesharex-salt').digest('hex');
+}
+
+function getRoomList() {
+  return Array.from(rooms.values()).map(r => ({
+    id: r.id,
+    displayName: r.displayName,
+    hasPassword: r.hasPassword,
+    createdBy: r.createdBy,
+    createdAt: r.createdAt,
+    isDefault: r.isDefault || false,
+  }));
+}
+
 // ----------------------------------------
 // Express HTTP Endpoints
 // ----------------------------------------
@@ -103,6 +143,41 @@ app.get('/api/info', (req, res) => {
     url: localUrl,
     qr: primaryQrDataUrl
   });
+});
+
+// List all rooms
+app.get('/api/rooms', (req, res) => {
+  res.json(getRoomList());
+});
+
+// Create a room via REST (also callable from socket)
+app.post('/api/rooms', (req, res) => {
+  const { name, password, createdBy } = req.body;
+
+  if (!name) return res.status(400).json({ error: 'Room name is required' });
+
+  const clean = name.toLowerCase().replace(/[^a-z0-9_-]/g, '-').substring(0, 32);
+  const id = `#${clean}`;
+
+  if (rooms.has(id)) {
+    return res.status(409).json({ error: 'A room with that name already exists' });
+  }
+
+  const hasPassword = !!(password && password.trim());
+  rooms.set(id, {
+    id,
+    displayName: clean,
+    hasPassword,
+    passwordHash: hasPassword ? hashPassword(password.trim()) : null,
+    createdBy: createdBy || 'unknown',
+    createdAt: Date.now(),
+    isDefault: false,
+  });
+
+  // Broadcast room list update to all clients
+  io.emit('room-list-update', getRoomList());
+
+  res.json({ success: true, room: { id, displayName: clean, hasPassword } });
 });
 
 // Check chunk upload status (to resume uploads)
@@ -320,10 +395,35 @@ io.on('connection', (socket) => {
     ip: rawIp
   });
 
+  // Send current room list on connect
+  socket.emit('room-list-update', getRoomList());
+
   // Handle Client Initial Join
-  socket.on('join-channel', async (channelName) => {
+  socket.on('join-channel', async (channelName, password, callback) => {
     const user = onlineUsers.get(socket.id);
     if (!user) return;
+
+    // Normalise: support old callers that pass no password/callback
+    if (typeof password === 'function') { callback = password; password = null; }
+    if (typeof callback !== 'function') callback = null;
+
+    const room = rooms.get(channelName);
+    if (!room) {
+      if (callback) callback({ error: 'Room does not exist' });
+      return;
+    }
+
+    // Password check
+    if (room.hasPassword) {
+      if (!password) {
+        if (callback) callback({ error: 'password_required' });
+        return;
+      }
+      if (hashPassword(password) !== room.passwordHash) {
+        if (callback) callback({ error: 'wrong_password' });
+        return;
+      }
+    }
 
     const oldChannel = user.currentChannel;
     socket.leave(oldChannel);
@@ -349,6 +449,38 @@ io.on('connection', (socket) => {
       message: `${user.username} joined the channel.`,
       timestamp: Date.now()
     });
+
+    if (callback) callback({ success: true });
+  });
+
+  // Handle Room Creation via socket
+  socket.on('create-room', ({ name, password }, callback) => {
+    const user = onlineUsers.get(socket.id);
+    if (!user) return;
+
+    const clean = name.toLowerCase().replace(/[^a-z0-9_-]/g, '-').substring(0, 32);
+    const id = `#${clean}`;
+
+    if (rooms.has(id)) {
+      if (callback) callback({ error: 'A room with that name already exists' });
+      return;
+    }
+
+    const hasPassword = !!(password && password.trim());
+    rooms.set(id, {
+      id,
+      displayName: clean,
+      hasPassword,
+      passwordHash: hasPassword ? hashPassword(password.trim()) : null,
+      createdBy: user.username,
+      createdAt: Date.now(),
+      isDefault: false,
+    });
+
+    // Broadcast updated room list to all clients
+    io.emit('room-list-update', getRoomList());
+
+    if (callback) callback({ success: true, roomId: id });
   });
 
   // Handle Username Selection/Change
@@ -402,6 +534,44 @@ io.on('connection', (socket) => {
       console.error('Error searching messages:', err);
       callback([]);
     }
+  });
+
+  // Delete a message (sender only)
+  socket.on('delete-message', async ({ msgId }) => {
+    const user = onlineUsers.get(socket.id);
+    if (!user || !msgId) return;
+
+    try {
+      const msg = await db.getMessageById(msgId);
+      if (!msg) return;
+      if (msg.username !== user.username) return; // only sender can delete
+
+      await db.deleteMessage(msgId);
+      // Broadcast removal to everyone in that channel
+      io.to(msg.channel).emit('message-deleted', { msgId });
+    } catch (err) {
+      console.error('Error deleting message:', err);
+    }
+  });
+
+  // Delete a room (creator only)
+  socket.on('delete-room', ({ roomId }) => {
+    const user = onlineUsers.get(socket.id);
+    if (!user) return;
+
+    const room = rooms.get(roomId);
+    if (!room) return;
+    if (room.isDefault) return; // protect built-in rooms
+    if (room.createdBy !== user.username) return; // only creator can delete
+
+    rooms.delete(roomId);
+
+    // Notify all clients so they can move out of the deleted room
+    io.emit('room-deleted', { roomId });
+    // Send updated room list
+    io.emit('room-list-update', getRoomList());
+
+    console.log(`Room ${roomId} deleted by ${user.username}`);
   });
 
   // Handle Typing Status updates

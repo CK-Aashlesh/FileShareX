@@ -105,6 +105,24 @@ class SQLiteDB {
       });
     });
   }
+
+  getMessageById(id) {
+    return new Promise((resolve, reject) => {
+      this.db.get('SELECT * FROM messages WHERE id = ?', [id], (err, row) => {
+        if (err) return reject(err);
+        resolve(row || null);
+      });
+    });
+  }
+
+  deleteMessage(id) {
+    return new Promise((resolve, reject) => {
+      this.db.run('DELETE FROM messages WHERE id = ?', [id], (err) => {
+        if (err) return reject(err);
+        resolve();
+      });
+    });
+  }
 }
 
 // JSON Fallback implementation (extremely robust, doesn't require native modules)
@@ -167,6 +185,27 @@ const jsonDB = {
       });
       resolve(filtered);
     });
+  },
+
+  getMessageById(id) {
+    return new Promise((resolve) => {
+      resolve(jsonDbData.find(m => m.id == id) || null);
+    });
+  },
+
+  deleteMessage(id) {
+    return new Promise((resolve, reject) => {
+      const idx = jsonDbData.findIndex(m => m.id == id);
+      if (idx !== -1) jsonDbData.splice(idx, 1);
+      try {
+        const tempPath = JSON_PATH + '.tmp';
+        fs.writeFileSync(tempPath, JSON.stringify(jsonDbData, null, 2), 'utf8');
+        fs.renameSync(tempPath, JSON_PATH);
+        resolve();
+      } catch (err) {
+        reject(err);
+      }
+    });
   }
 };
 
@@ -201,5 +240,15 @@ module.exports = {
   async searchMessages(channel, searchTerm) {
     if (!dbInstance) throw new Error('Database not initialized');
     return dbInstance.searchMessages(channel, searchTerm);
+  },
+
+  async getMessageById(id) {
+    if (!dbInstance) throw new Error('Database not initialized');
+    return dbInstance.getMessageById(id);
+  },
+
+  async deleteMessage(id) {
+    if (!dbInstance) throw new Error('Database not initialized');
+    return dbInstance.deleteMessage(id);
   }
 };
